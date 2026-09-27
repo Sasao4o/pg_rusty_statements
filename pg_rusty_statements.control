@@ -1,0 +1,6 @@
+comment = 'pg_rusty_statements:  Created by pgrx'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'pg_rusty_statements'
+relocatable = false
+superuser = true
+trusted = false
