@@ -11,6 +11,8 @@ static mut MY_LOCK : *mut pg_sys::LWLock = std::ptr::null_mut();
 const QUERY_STRING_MAX_LENGTH: usize = 1024;
 const MAX_ENTRIES: i64 = 1000;
 
+
+ 
 #[repr(C)]
 struct QueryHashKey {
     query_hash: u64
@@ -22,6 +24,7 @@ struct QueryEntry {
     calls : u64,
     total_time_ms : f64,
     total_rows : u64,
+    query_string_len: u16,
     query_string: [u8; QUERY_STRING_MAX_LENGTH]
 }
 
@@ -41,7 +44,6 @@ fn _PG_init() {
     }
 
     pgrx::info!("_PG_init called");
-
     unsafe {
         PREV_EXECUTOR_RUN_HOOK = pg_sys::ExecutorRun_hook;
         PREV_EXECUTOR_FINISH_HOOK = pg_sys::ExecutorFinish_hook;
@@ -93,10 +95,11 @@ unsafe extern "C-unwind" fn shmem_startup() {
     );
 }
 
-fn set_query_string(dest: &mut [u8; QUERY_STRING_MAX_LENGTH], src: &[u8]) {
-    let len = src.len().min(dest.len() - 1);
+fn set_query_string(dest: &mut [u8; QUERY_STRING_MAX_LENGTH], src: &[u8]) -> u16 {
+    let len = src.len().min(dest.len());
     dest[..len].copy_from_slice(&src[..len]);
-    dest[len..].fill(0); // clears any old bytes past the new content, including the terminator slot
+    dest[len..].fill(0);
+    len as u16
 }
 
 unsafe fn process_query(query_hash: u64, query_string: &[u8], elapsed_ms: f64, rows: u64) {
@@ -116,16 +119,16 @@ unsafe fn process_query(query_hash: u64, query_string: &[u8], elapsed_ms: f64, r
         entry.calls = 0;
         entry.total_time_ms = 0.0;
         entry.total_rows = 0;
-        entry.query_string.fill(0);
+        entry.query_string_len = 0;
     }
 
-    set_query_string(&mut entry.query_string, query_string);
+    entry.query_string_len = set_query_string(&mut entry.query_string, query_string);
 
     entry.calls += 1;
     entry.total_time_ms += elapsed_ms;
     entry.total_rows += rows;
 
-    let stored_len = entry.query_string.iter().position(|&b| b == 0).unwrap_or(QUERY_STRING_MAX_LENGTH);
+    let stored_len = entry.query_string_len as usize;
     let stored_query = String::from_utf8_lossy(&entry.query_string[..stored_len]);
 
     pgrx::info!(
