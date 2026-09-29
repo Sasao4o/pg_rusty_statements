@@ -6,7 +6,7 @@ static mut PREV_EXECUTOR_RUN_HOOK : pg_sys::ExecutorRun_hook_type = None;
 static mut PREV_EXECUTOR_FINISH_HOOK : pg_sys::ExecutorFinish_hook_type = None;
 static mut PREV_SHMEM_STARTUP_HOOK : pg_sys::shmem_startup_hook_type = None;
 static mut PREV_SHMEM_REQUEST_HOOK : pg_sys::shmem_request_hook_type = None;
-static mut MY_LOCK : *mut pg_sys::LWLock = std::ptr::null_mut();
+static mut HTAB_LOCK : *mut pg_sys::LWLock = std::ptr::null_mut();
 
 const QUERY_STRING_MAX_LENGTH: usize = 1024;
 const MAX_ENTRIES: i64 = 1000;
@@ -82,7 +82,7 @@ unsafe extern "C-unwind" fn shmem_startup() {
     }
 
     let locks = pg_sys::GetNamedLWLockTranche(c"my_extension_tranche".as_ptr());
-    MY_LOCK = &mut (*locks).lock;
+    HTAB_LOCK = &mut (*locks).lock;
 
     let mut info: pg_sys::HASHCTL = std::mem::zeroed();
     info.keysize = std::mem::size_of::<QueryHashKey>() as _;
@@ -105,7 +105,7 @@ fn set_query_string(dest: &mut [u8; QUERY_STRING_MAX_LENGTH], src: &[u8]) -> u16
 }
 
 unsafe fn process_query(query_hash: u64, query_string: &[u8], elapsed_ms: f64, rows: u64) {
-    pg_sys::LWLockAcquire(MY_LOCK, pg_sys::LWLockMode::LW_EXCLUSIVE);
+    pg_sys::LWLockAcquire(HTAB_LOCK, pg_sys::LWLockMode::LW_EXCLUSIVE);
 
     let key = QueryHashKey { query_hash };
     let mut found: bool = false;
@@ -142,18 +142,38 @@ unsafe fn process_query(query_hash: u64, query_string: &[u8], elapsed_ms: f64, r
         stored_query
     );
 
-    pg_sys::LWLockRelease(MY_LOCK);
+    pg_sys::LWLockRelease(HTAB_LOCK);
 }
 
-unsafe fn hash_query_string(query_string: &[u8]) -> u64 {
-    // simple FNV-1a hash; good enough as a shared-memory hash table key
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for &byte in query_string {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+#[pg_extern]
+fn get_query_stats() -> TableIterator<'static, (name!(query_string, String), name!(calls, i64), name!(total_time_ms, f64), name!(total_rows, i64))> {
+    let mut stats = Vec::new();
+
+    unsafe {
+        pg_sys::LWLockAcquire(HTAB_LOCK, pg_sys::LWLockMode::LW_SHARED);
+
+        let mut status: pg_sys::HASH_SEQ_STATUS = std::mem::zeroed();
+        pg_sys::hash_seq_init(&mut status, QUERY_HTAB);
+
+        loop {
+            let entry = pg_sys::hash_seq_search(&mut status) as *mut QueryEntry;
+            if entry.is_null() {
+                break;
+            }
+
+            let entry = &*entry;
+            let stored_len = entry.query_string_len as usize;
+            let query_string = String::from_utf8_lossy(&entry.query_string[..stored_len]).into_owned();
+            stats.push((query_string, entry.calls as i64, entry.total_time_ms, entry.total_rows as i64));
+        }
+        // hash_seq_search already terminates the scan when it returns NULL; no explicit hash_seq_term needed here.
+
+        pg_sys::LWLockRelease(HTAB_LOCK);
     }
-    hash
+
+    TableIterator::new(stats)
 }
+
 
 #[pg_guard]
 unsafe extern "C-unwind" fn execute_run( query_desc: *mut pg_sys::QueryDesc,
