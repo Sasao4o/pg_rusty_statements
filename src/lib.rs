@@ -50,7 +50,7 @@ fn _PG_init() {
         PREV_EXECUTOR_RUN_HOOK = pg_sys::ExecutorRun_hook;
         PREV_EXECUTOR_FINISH_HOOK = pg_sys::ExecutorFinish_hook;
 
-        pg_sys::ExecutorRun_hook = Some(excute_run);
+        pg_sys::ExecutorRun_hook = Some(execute_run);
         pg_sys::ExecutorFinish_hook = Some(say_end);
 
     }
@@ -155,6 +155,7 @@ unsafe fn hash_query_string(query_string: &[u8]) -> u64 {
     hash
 }
 
+#[pg_guard]
 unsafe extern "C-unwind" fn execute_run( query_desc: *mut pg_sys::QueryDesc,
     direction: pg_sys::ScanDirection::Type,
     count: pg_sys::uint64, execute_once: bool) {
