@@ -42,13 +42,15 @@ fn _PG_init() {
     if unsafe { !pg_sys::process_shared_preload_libraries_in_progress } {
         pgrx::error!("this extension must be loaded via shared_preload_libraries because it requires shared memory.");
     }
-
+ 
     pgrx::info!("_PG_init called");
     unsafe {
+        pg_sys::EnableQueryId(); //this is because i depend on postgres normalization to generate query IDs
+
         PREV_EXECUTOR_RUN_HOOK = pg_sys::ExecutorRun_hook;
         PREV_EXECUTOR_FINISH_HOOK = pg_sys::ExecutorFinish_hook;
 
-        pg_sys::ExecutorRun_hook = Some(execute);
+        pg_sys::ExecutorRun_hook = Some(excute_run);
         pg_sys::ExecutorFinish_hook = Some(say_end);
 
     }
@@ -153,7 +155,7 @@ unsafe fn hash_query_string(query_string: &[u8]) -> u64 {
     hash
 }
 
-unsafe extern "C-unwind" fn execute( query_desc: *mut pg_sys::QueryDesc,
+unsafe extern "C-unwind" fn execute_run( query_desc: *mut pg_sys::QueryDesc,
     direction: pg_sys::ScanDirection::Type,
     count: pg_sys::uint64, execute_once: bool) {
     let start = std::time::Instant::now();
@@ -168,7 +170,8 @@ unsafe extern "C-unwind" fn execute( query_desc: *mut pg_sys::QueryDesc,
     let rows = (*(*query_desc).estate).es_processed as u64;
 
     let query_string = std::ffi::CStr::from_ptr((*query_desc).sourceText).to_bytes();
-    let query_hash = hash_query_string(query_string);
+    let query_hash = (*(*query_desc).plannedstmt).queryId; 
+
 
     process_query(query_hash, query_string, elapsed_ms, rows);
 }
