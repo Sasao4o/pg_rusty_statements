@@ -2,7 +2,8 @@ use pgrx::prelude::*;
 
 ::pgrx::pg_module_magic!(name, version);
 
-static mut PREV_EXECUTOR_RUN_HOOK : pg_sys::ExecutorRun_hook_type = None;
+static mut PREV_EXECUTOR_START_HOOK : pg_sys::ExecutorStart_hook_type = None;
+static mut PREV_EXECUTOR_END_HOOK : pg_sys::ExecutorEnd_hook_type = None;
 static mut PREV_EXECUTOR_FINISH_HOOK : pg_sys::ExecutorFinish_hook_type = None;
 static mut PREV_SHMEM_STARTUP_HOOK : pg_sys::shmem_startup_hook_type = None;
 static mut PREV_SHMEM_REQUEST_HOOK : pg_sys::shmem_request_hook_type = None;
@@ -47,11 +48,13 @@ fn _PG_init() {
     unsafe {
         pg_sys::EnableQueryId(); //this is because i depend on postgres normalization to generate query IDs
 
-        PREV_EXECUTOR_RUN_HOOK = pg_sys::ExecutorRun_hook;
+        PREV_EXECUTOR_START_HOOK = pg_sys::ExecutorStart_hook;
         PREV_EXECUTOR_FINISH_HOOK = pg_sys::ExecutorFinish_hook;
+        PREV_EXECUTOR_END_HOOK = pg_sys::ExecutorEnd_hook;
 
-        pg_sys::ExecutorRun_hook = Some(execute_run);
+        pg_sys::ExecutorStart_hook = Some(executor_start);
         pg_sys::ExecutorFinish_hook = Some(say_end);
+        pg_sys::ExecutorEnd_hook = Some(executor_end);
 
     }
     
@@ -104,6 +107,77 @@ fn set_query_string(dest: &mut [u8; QUERY_STRING_MAX_LENGTH], src: &[u8]) -> u16
     len as u16
 }
 
+
+#[pg_extern]
+fn get_query_stats() -> TableIterator<'static, (name!(query_string, String), name!(calls, i64), name!(total_time_ms, f64), name!(total_rows, i64))> {
+    let mut stats = Vec::new();
+
+    unsafe {
+        pg_sys::LWLockAcquire(HTAB_LOCK, pg_sys::LWLockMode::LW_SHARED);
+
+        let mut status: pg_sys::HASH_SEQ_STATUS = std::mem::zeroed();
+        pg_sys::hash_seq_init(&mut status, QUERY_HTAB);
+
+        loop {
+            let entry = pg_sys::hash_seq_search(&mut status) as *mut QueryEntry;
+            if entry.is_null() {
+                break;
+            }
+
+            let entry = &*entry;
+            let stored_len = entry.query_string_len as usize;
+            let query_string = String::from_utf8_lossy(&entry.query_string[..stored_len]).into_owned();
+            stats.push((query_string, entry.calls as i64, entry.total_time_ms, entry.total_rows as i64));
+        }
+        // hash_seq_search already terminates the scan when it returns NULL; no explicit hash_seq_term needed here.
+
+        pg_sys::LWLockRelease(HTAB_LOCK);
+    }
+
+    TableIterator::new(stats)
+}
+
+
+#[pg_guard]
+unsafe extern "C-unwind" fn executor_start(query_desc: *mut pg_sys::QueryDesc, eflags: i32) {
+    if let Some(prev_hook) = PREV_EXECUTOR_START_HOOK {
+        prev_hook(query_desc, eflags);
+    } else {
+        pg_sys::standard_ExecutorStart(query_desc, eflags);
+    }
+
+    // Postgres updates totaltime around ExecutorRun/Finish; allocate in es_query_cxt so it lives until ExecutorEnd.
+    if (*(*query_desc).plannedstmt).queryId != 0 && (*query_desc).totaltime.is_null() {
+        let old_cxt = pg_sys::MemoryContextSwitchTo((*(*query_desc).estate).es_query_cxt);
+        (*query_desc).totaltime =
+            pg_sys::InstrAlloc(1, pg_sys::InstrumentOption::INSTRUMENT_ALL as i32, false);
+        pg_sys::MemoryContextSwitchTo(old_cxt);
+    }
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn executor_end(query_desc: *mut pg_sys::QueryDesc) {
+    let query_hash = (*(*query_desc).plannedstmt).queryId;
+    let totaltime = (*query_desc).totaltime;
+
+    if query_hash != 0 && !totaltime.is_null() {
+        pg_sys::InstrEndLoop(totaltime);
+        let elapsed_ms = (*totaltime).total * 1000.0;
+        let rows = (*(*query_desc).estate).es_total_processed;
+        let query_string = std::ffi::CStr::from_ptr((*query_desc).sourceText).to_bytes();
+
+        process_query(query_hash, query_string, elapsed_ms, rows);
+    }
+
+    if let Some(prev_hook) = PREV_EXECUTOR_END_HOOK {
+        prev_hook(query_desc);
+    } else {
+        pg_sys::standard_ExecutorEnd(query_desc);
+    }
+}
+
+
+
 unsafe fn process_query(query_hash: u64, query_string: &[u8], elapsed_ms: f64, rows: u64) {
     pg_sys::LWLockAcquire(HTAB_LOCK, pg_sys::LWLockMode::LW_EXCLUSIVE);
 
@@ -143,58 +217,6 @@ unsafe fn process_query(query_hash: u64, query_string: &[u8], elapsed_ms: f64, r
     );
 
     pg_sys::LWLockRelease(HTAB_LOCK);
-}
-
-#[pg_extern]
-fn get_query_stats() -> TableIterator<'static, (name!(query_string, String), name!(calls, i64), name!(total_time_ms, f64), name!(total_rows, i64))> {
-    let mut stats = Vec::new();
-
-    unsafe {
-        pg_sys::LWLockAcquire(HTAB_LOCK, pg_sys::LWLockMode::LW_SHARED);
-
-        let mut status: pg_sys::HASH_SEQ_STATUS = std::mem::zeroed();
-        pg_sys::hash_seq_init(&mut status, QUERY_HTAB);
-
-        loop {
-            let entry = pg_sys::hash_seq_search(&mut status) as *mut QueryEntry;
-            if entry.is_null() {
-                break;
-            }
-
-            let entry = &*entry;
-            let stored_len = entry.query_string_len as usize;
-            let query_string = String::from_utf8_lossy(&entry.query_string[..stored_len]).into_owned();
-            stats.push((query_string, entry.calls as i64, entry.total_time_ms, entry.total_rows as i64));
-        }
-        // hash_seq_search already terminates the scan when it returns NULL; no explicit hash_seq_term needed here.
-
-        pg_sys::LWLockRelease(HTAB_LOCK);
-    }
-
-    TableIterator::new(stats)
-}
-
-
-#[pg_guard]
-unsafe extern "C-unwind" fn execute_run( query_desc: *mut pg_sys::QueryDesc,
-    direction: pg_sys::ScanDirection::Type,
-    count: pg_sys::uint64, execute_once: bool) {
-    let start = std::time::Instant::now();
-
-    if let Some(prev_hook) = PREV_EXECUTOR_RUN_HOOK {
-        prev_hook(query_desc, direction, count, execute_once);
-    } else {
-        pg_sys::standard_ExecutorRun(query_desc, direction, count, execute_once);
-    }
-
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let rows = (*(*query_desc).estate).es_processed as u64;
-
-    let query_string = std::ffi::CStr::from_ptr((*query_desc).sourceText).to_bytes();
-    let query_hash = (*(*query_desc).plannedstmt).queryId; 
-
-
-    process_query(query_hash, query_string, elapsed_ms, rows);
 }
 
 
