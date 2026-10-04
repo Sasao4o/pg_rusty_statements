@@ -12,7 +12,7 @@ static mut HTAB_LOCK : *mut pg_sys::LWLock = std::ptr::null_mut();
 const QUERY_STRING_MAX_LENGTH: usize = 1024;
 const MAX_ENTRIES: i64 = 1000;
 
-
+const IS_DEBUG : bool = true;
  
 #[repr(C)]
 struct QueryHashKey {
@@ -33,6 +33,10 @@ static mut QUERY_HTAB : *mut pg_sys::HTAB = std::ptr::null_mut();
 
 #[pg_extern]
 fn hello_pg_rusty_statements() -> &'static str {
+    if IS_DEBUG {
+        pgrx::info!("hello_pg_rusty_statements called");
+    }
+
     "Hello, pg_rusty_statements"
 }
 
@@ -43,8 +47,10 @@ fn _PG_init() {
     if unsafe { !pg_sys::process_shared_preload_libraries_in_progress } {
         pgrx::error!("this extension must be loaded via shared_preload_libraries because it requires shared memory.");
     }
- 
+    
+    if IS_DEBUG {
     pgrx::info!("_PG_init called");
+    }
     unsafe {
         pg_sys::EnableQueryId(); //this is because i depend on postgres normalization to generate query IDs
 
@@ -206,22 +212,25 @@ unsafe fn process_query(query_hash: u64, query_string: &[u8], elapsed_ms: f64, r
 
     let stored_len = entry.query_string_len as usize;
     let stored_query = String::from_utf8_lossy(&entry.query_string[..stored_len]);
-
-    pgrx::info!(
-        "query_hash: {}, calls: {}, total_time_ms: {}, total_rows: {}, query: {}",
-        query_hash,
-        entry.calls,
-        entry.total_time_ms,
-        entry.total_rows,
-        stored_query
-    );
+    if IS_DEBUG {
+        pgrx::info!(
+            "query_hash: {}, calls: {}, total_time_ms: {}, total_rows: {}, query: {}",
+            query_hash,
+            entry.calls,
+            entry.total_time_ms,
+            entry.total_rows,
+            stored_query
+        );
+    }
 
     pg_sys::LWLockRelease(HTAB_LOCK);
 }
 
 
 unsafe extern "C-unwind" fn say_end(query_desc: *mut pg_sys::QueryDesc) {
-    pgrx::info!("Hello from say_end");
+    if IS_DEBUG {
+        pgrx::info!("Hello from say_end");
+    }
     if let Some(prev_hook) = PREV_EXECUTOR_FINISH_HOOK {
         prev_hook(query_desc);
     } else {
@@ -229,45 +238,4 @@ unsafe extern "C-unwind" fn say_end(query_desc: *mut pg_sys::QueryDesc) {
     }
 }
 
-
-#[cfg(any(test, feature = "pg_test"))]
-#[pg_schema]
-mod tests {
-    use pgrx::prelude::*;
-
-    #[pg_test]
-    fn test_hello_pg_rusty_statements() {
-        assert_eq!("Hello, pg_rusty_statements", crate::hello_pg_rusty_statements());
-    }
-
-}
-
-
-#[cfg(feature = "pg_bench")]
-#[pg_schema]
-mod benches {
-    use pgrx::prelude::*;
-    use pgrx_bench::{Bencher, black_box};
-
-    #[pg_bench]
-    fn bench_hello_pg_rusty_statements(b: &mut Bencher) {
-        b.iter(|| {
-            black_box(crate::hello_pg_rusty_statements());
-        });
-    }
-}
-
-/// This module is required by `cargo pgrx test` invocations.
-/// It must be visible at the root of your extension crate.
-#[cfg(test)]
-pub mod pg_test {
-    pub fn setup(_options: Vec<&str>) {
-        // perform one-off initialization when the pg_test framework starts
-    }
-
-    #[must_use]
-    pub fn postgresql_conf_options() -> Vec<&'static str> {
-        // return any postgresql.conf settings that are required for your tests
-        vec![]
-    }
-}
+ 
